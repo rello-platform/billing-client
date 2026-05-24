@@ -32,6 +32,11 @@ const billing = createBillingClient({
 const status = await billing.getStatus(tenantId);
 const allowed = await billing.checkAccess(tenantId, "homeready");
 
+// Revenue-only per-app spend summary (powers the in-app billing panel).
+// Defaults to the current calendar month; pass { year, month } for another.
+const summary = await billing.getUsageSummary(tenantId);
+const lastMonth = await billing.getUsageSummary(tenantId, { year: 2026, month: 4 });
+
 // Writes — fail-closed (throws BillingError on any error)
 await billing.reportUsage(tenantId, {
   metric: "emails_sent",
@@ -83,6 +88,7 @@ If neither is provided, `createBillingClient` throws synchronously.
 |-----------|-------------|
 | `getStatus` | Returns last cached value, else permissive default. Structured log emitted. |
 | `getEntitlements` | Returns last cached, else "allow all" placeholder. |
+| `getUsageSummary` | Returns last cached, else a safe-empty summary ($0, no rows/allotments, portal unavailable) — the panel always renders. Structured log emitted. |
 | `checkAccess` | Returns `true` (permissive). |
 | `reportUsage` | **Throws** `BillingError`. Caller is responsible for DLQ (each spoke app maintains a `UsageReportDLQ` table per spec). |
 | `createCheckoutSession`, `createPortalSession`, `addAddOn`, `removeAddOn`, `cancelSubscription`, `resumeSubscription`, `updateSubscription` | **Throw** `BillingError`. |

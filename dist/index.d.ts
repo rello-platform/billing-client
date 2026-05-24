@@ -14,5 +14,5 @@ export { createBillingClient } from "./client.js";
 export type { BillingClient } from "./client.js";
 export { verifyWebhookSignature, signWebhookPayload } from "./webhook.js";
 export { BillingError } from "./errors.js";
-export type { AddOnRequest, AddOnResponse, BillingClientConfig, BillingErrorCode, BillingStatus, BillingSubscriptionStatus, CheckoutSessionRequest, CheckoutSessionResponse, Entitlement, FailOpenEvent, FailOpenReason, PortalSessionRequest, PortalSessionResponse, RemoveAddOnResponse, SubscriptionCancelRequest, SubscriptionCancelResponse, SubscriptionResumeResponse, SubscriptionUpdateRequest, SubscriptionUpdateResponse, UsageReport, WebhookEvent, WebhookEventType, } from "./types.js";
+export type { AddOnRequest, AddOnResponse, BillingClientConfig, BillingErrorCode, BillingStatus, BillingSubscriptionStatus, BillingUsageAllotment, BillingUsageSummary, BillingUsageSummaryOptions, BillingUsageSummaryPeriod, BillingUsageSummaryRow, CheckoutSessionRequest, CheckoutSessionResponse, Entitlement, FailOpenEvent, FailOpenReason, PortalSessionRequest, PortalSessionResponse, RemoveAddOnResponse, SubscriptionCancelRequest, SubscriptionCancelResponse, SubscriptionResumeResponse, SubscriptionUpdateRequest, SubscriptionUpdateResponse, UsageReport, WebhookEvent, WebhookEventType, } from "./types.js";
 //# sourceMappingURL=index.d.ts.map

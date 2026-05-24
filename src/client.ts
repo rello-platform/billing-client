@@ -6,6 +6,8 @@ import type {
   AddOnResponse,
   BillingClientConfig,
   BillingStatus,
+  BillingUsageSummary,
+  BillingUsageSummaryOptions,
   CheckoutSessionRequest,
   CheckoutSessionResponse,
   Entitlement,
@@ -22,11 +24,29 @@ import type {
   UsageReport,
 } from "./types.js";
 
+/** The v1 summary endpoint wraps its payload in a success envelope. */
+type BillingUsageSummaryEnvelope = {
+  success?: boolean;
+  data?: BillingUsageSummary;
+  error?: string;
+};
+
 export type BillingClient = {
   /** GET /api/v1/billing/status — cached 60s. Fail-open. */
   getStatus(tenantId: string): Promise<BillingStatus>;
   /** GET /api/v1/billing/entitlements — cached 60s. Fail-open. */
   getEntitlements(tenantId: string): Promise<Entitlement[]>;
+  /**
+   * GET /api/v1/billing/usage/summary — revenue-only per-app spend summary
+   * (PER-APP-BILLING-PANELS). Cached 60s. Fail-open: returns a safe-empty
+   * summary (no rows/allotments, $0, portal unavailable) on any read miss so a
+   * billing panel never hard-errors. Optional `{ year, month }` selects a
+   * calendar month (defaults to the current month).
+   */
+  getUsageSummary(
+    tenantId: string,
+    opts?: BillingUsageSummaryOptions,
+  ): Promise<BillingUsageSummary>;
   /** Convenience helper. Fail-open: returns `true` on any non-explicit deny. */
   checkAccess(tenantId: string, feature: string): Promise<boolean>;
 
@@ -84,6 +104,56 @@ function permissiveEntitlement(feature: string): Entitlement {
     isExpired: false,
     limits: {},
     currentUsage: {},
+  };
+}
+
+const MONTH_LABELS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+/**
+ * Safe-empty summary returned on a fail-open read (DL6: a panel must always
+ * render — never hard-error on a billing-read miss). Period defaults to the
+ * requested month, else the current calendar month. Computed in UTC so the
+ * window is deterministic regardless of host timezone.
+ */
+function emptyUsageSummary(
+  appSlug: string,
+  opts?: BillingUsageSummaryOptions,
+): BillingUsageSummary {
+  const now = new Date();
+  const year = opts?.year ?? now.getUTCFullYear();
+  const month = opts?.month ?? now.getUTCMonth() + 1;
+  const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+  const label = `${MONTH_LABELS[month - 1] ?? `M${month}`} ${year}`;
+  return {
+    appSlug,
+    appName: appSlug,
+    period: {
+      year,
+      month,
+      label,
+      start: start.toISOString(),
+      end: end.toISOString(),
+    },
+    totalRevenueCents: 0,
+    totalRevenueKnown: false,
+    recordCount: 0,
+    rows: [],
+    allotments: [],
+    portalAvailable: false,
   };
 }
 
@@ -196,6 +266,53 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
       const stale = cache.getStale<Entitlement[]>(tenantId, "entitlements");
       if (stale) return stale;
       return [];
+    },
+
+    async getUsageSummary(tenantId, opts) {
+      // Cache key varies by period so a month switch isn't masked by a hit.
+      const cacheOp = `usageSummary::${opts?.year ?? "cur"}-${opts?.month ?? "cur"}`;
+      const cached = cache.get<BillingUsageSummary>(tenantId, cacheOp);
+      if (cached) return cached;
+
+      const query = new URLSearchParams();
+      if (opts?.year != null) query.set("year", String(opts.year));
+      if (opts?.month != null) query.set("month", String(opts.month));
+      const qs = query.toString();
+      const path = `/billing/usage/summary${qs ? `?${qs}` : ""}`;
+
+      const result = await executeWithRetries<BillingUsageSummaryEnvelope>(
+        baseUrl,
+        cfg,
+        { method: "GET", path, tenantId, attempts: 3 },
+      );
+
+      if (result.ok) {
+        // The endpoint wraps the payload as { success, data }. A 200 with a
+        // missing/!success body is an invalid response → treat as fail-open.
+        if (result.data?.success && result.data.data) {
+          cache.set(tenantId, cacheOp, result.data.data);
+          return result.data.data;
+        }
+        const malformed = new BillingError(
+          "BILLING_INVALID_REQUEST",
+          result.status,
+          `Rello billing API returned ${result.status} with a missing/invalid usage summary body${
+            result.data?.error ? `: ${result.data.error}` : ""
+          }`,
+          result.requestId,
+        );
+        reportError(malformed);
+        logFailOpen("getUsageSummary", tenantId, malformed);
+        const stale = cache.getStale<BillingUsageSummary>(tenantId, cacheOp);
+        if (stale) return stale;
+        return emptyUsageSummary(cfg.appSlug, opts);
+      }
+
+      reportError(result.error);
+      logFailOpen("getUsageSummary", tenantId, result.error);
+      const stale = cache.getStale<BillingUsageSummary>(tenantId, cacheOp);
+      if (stale) return stale;
+      return emptyUsageSummary(cfg.appSlug, opts);
     },
 
     async checkAccess(tenantId, feature) {

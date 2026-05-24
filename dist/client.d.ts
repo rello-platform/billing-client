@@ -1,9 +1,17 @@
-import type { AddOnRequest, AddOnResponse, BillingClientConfig, BillingStatus, CheckoutSessionRequest, CheckoutSessionResponse, Entitlement, PortalSessionRequest, PortalSessionResponse, RemoveAddOnResponse, SubscriptionCancelRequest, SubscriptionCancelResponse, SubscriptionResumeResponse, SubscriptionUpdateRequest, SubscriptionUpdateResponse, UsageReport } from "./types.js";
+import type { AddOnRequest, AddOnResponse, BillingClientConfig, BillingStatus, BillingUsageSummary, BillingUsageSummaryOptions, CheckoutSessionRequest, CheckoutSessionResponse, Entitlement, PortalSessionRequest, PortalSessionResponse, RemoveAddOnResponse, SubscriptionCancelRequest, SubscriptionCancelResponse, SubscriptionResumeResponse, SubscriptionUpdateRequest, SubscriptionUpdateResponse, UsageReport } from "./types.js";
 export type BillingClient = {
     /** GET /api/v1/billing/status — cached 60s. Fail-open. */
     getStatus(tenantId: string): Promise<BillingStatus>;
     /** GET /api/v1/billing/entitlements — cached 60s. Fail-open. */
     getEntitlements(tenantId: string): Promise<Entitlement[]>;
+    /**
+     * GET /api/v1/billing/usage/summary — revenue-only per-app spend summary
+     * (PER-APP-BILLING-PANELS). Cached 60s. Fail-open: returns a safe-empty
+     * summary (no rows/allotments, $0, portal unavailable) on any read miss so a
+     * billing panel never hard-errors. Optional `{ year, month }` selects a
+     * calendar month (defaults to the current month).
+     */
+    getUsageSummary(tenantId: string, opts?: BillingUsageSummaryOptions): Promise<BillingUsageSummary>;
     /** Convenience helper. Fail-open: returns `true` on any non-explicit deny. */
     checkAccess(tenantId: string, feature: string): Promise<boolean>;
     /** POST /api/v1/billing/usage — fail-closed (throws BillingError on error). */

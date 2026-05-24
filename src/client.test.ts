@@ -181,6 +181,162 @@ describe("checkAccess — fail-open default true", () => {
   });
 });
 
+describe("getUsageSummary — revenue-only, fail-open reads", () => {
+  const SAMPLE_SUMMARY = {
+    appSlug: "homeready",
+    appName: "HomeReady",
+    period: {
+      year: 2026,
+      month: 5,
+      label: "May 2026",
+      start: "2026-05-01T00:00:00.000Z",
+      end: "2026-05-31T23:59:59.999Z",
+    },
+    totalRevenueCents: 1234,
+    totalRevenueKnown: true,
+    recordCount: 3,
+    rows: [
+      {
+        appSlug: "homeready",
+        appName: "HomeReady",
+        metric: "emails_sent",
+        metricName: "Emails sent",
+        unit: "email",
+        service: "mailgun",
+        quantity: 100,
+        revenueCents: 1234,
+        revenueKnown: true,
+      },
+    ],
+    allotments: [
+      {
+        metric: "emails_sent",
+        metricName: "Emails sent",
+        included: 500,
+        used: 100,
+        remaining: 400,
+        overageCents: 1234,
+      },
+    ],
+    portalAvailable: true,
+  };
+
+  function envelope(data: unknown): Response {
+    return new Response(JSON.stringify({ success: true, data }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  it("unwraps { success, data } and returns the inner summary", async () => {
+    const client = createBillingClient(
+      cfg({ fetchImpl: makeFetch(() => envelope(SAMPLE_SUMMARY)) }),
+    );
+    const summary = await client.getUsageSummary("t_1");
+    expect(summary.totalRevenueCents).toBe(1234);
+    expect(summary.rows).toHaveLength(1);
+    expect(summary.allotments[0]?.remaining).toBe(400);
+    // Revenue-only contract — no costCents leaks through.
+    expect((summary as Record<string, unknown>).costCents).toBeUndefined();
+  });
+
+  it("appends ?year=&month= when opts are given", async () => {
+    let seenUrl = "";
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch((url) => {
+          seenUrl = url;
+          return envelope(SAMPLE_SUMMARY);
+        }),
+      }),
+    );
+    await client.getUsageSummary("t_1", { year: 2026, month: 4 });
+    expect(seenUrl).toContain("/api/v1/billing/usage/summary?year=2026&month=4");
+  });
+
+  it("caches within TTL (one fetch for two calls, same period)", async () => {
+    let calls = 0;
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch(() => {
+          calls++;
+          return envelope(SAMPLE_SUMMARY);
+        }),
+      }),
+    );
+    await client.getUsageSummary("t_1");
+    await client.getUsageSummary("t_1");
+    expect(calls).toBe(1);
+  });
+
+  it("does NOT mask a different period with a cache hit", async () => {
+    let calls = 0;
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch(() => {
+          calls++;
+          return envelope(SAMPLE_SUMMARY);
+        }),
+      }),
+    );
+    await client.getUsageSummary("t_1", { year: 2026, month: 5 });
+    await client.getUsageSummary("t_1", { year: 2026, month: 4 });
+    expect(calls).toBe(2);
+  });
+
+  it("returns a safe-empty summary on 5xx (fail-open, not a throw)", async () => {
+    const onFailOpen = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch(() => new Response("err", { status: 503 })),
+        onFailOpen,
+      }),
+    );
+    const summary = await client.getUsageSummary("t_1", { year: 2026, month: 5 });
+    expect(summary.rows).toEqual([]);
+    expect(summary.allotments).toEqual([]);
+    expect(summary.totalRevenueCents).toBe(0);
+    expect(summary.totalRevenueKnown).toBe(false);
+    expect(summary.recordCount).toBe(0);
+    expect(summary.portalAvailable).toBe(false);
+    expect(summary.period.label).toBe("May 2026");
+    expect(onFailOpen).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "billing_fail_open",
+        operation: "getUsageSummary",
+        reason: "upstream_5xx",
+      }),
+    );
+    warn.mockRestore();
+  });
+
+  it("fails open when a 200 body is missing/!success (invalid_response)", async () => {
+    const onFailOpen = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch(() =>
+          new Response(JSON.stringify({ success: false, error: "boom" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+        onFailOpen,
+      }),
+    );
+    const summary = await client.getUsageSummary("t_1");
+    expect(summary.rows).toEqual([]);
+    expect(onFailOpen).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: "getUsageSummary",
+        reason: "invalid_response",
+      }),
+    );
+    warn.mockRestore();
+  });
+});
+
 describe("writes — fail-closed", () => {
   it("throws BillingError on 5xx (after retries)", async () => {
     const client = createBillingClient(
