@@ -127,3 +127,17 @@ npm test            # vitest
 `dist/` is committed to the repo (per platform convention for `@rello-platform/*` packages — Railway nixpacks has no ssh client and consumers install via git ref).
 
 Publishing happens automatically on tagged push (`git tag v0.1.0 && git push --tags`) via `.github/workflows/publish.yml`.
+
+## Local verification (pre-push hook)
+
+CI (`ci.yml`) was retired 2026-05-24 (GH-Actions retirement workstream). Verification
+now runs locally via a committed husky-style `.husky/pre-push` hook — the same
+`tsc --noEmit && npm run build && npm test` the workflow ran.
+
+The hook is **not** auto-installed (no `prepare`/`postinstall` script — this is a
+git-dep package and a lifecycle script would run in every consumer's install). Enable
+it once per clone:
+
+```sh
+git config core.hooksPath .husky
+```

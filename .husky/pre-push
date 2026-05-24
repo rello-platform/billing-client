@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# Pre-push verification — replaces the retired ci.yml (GH-Actions retirement,
+# PLATFORM-PACKAGE-PIN-CONVENTION-AND-VERSION-SYNC; Kelly 2026-05-18 + scope
+# extension 2026-05-24). Runs the same typecheck + build + test the CI workflow
+# ran on every push/PR, now locally at zero Actions cost.
+#
+# No-prepare install (git-dep-safe): this is a committed @rello-platform/* package
+# consumed via `github:rello-platform/<pkg>#tag`. A prepare/postinstall script would
+# run in every consumer's install and can force npm into the clone-and-build ssh
+# path on Railway nixpacks (no ssh client) → platform-wide install break
+# (see feedback-rello-platform-packages-must-commit-dist-not-prepare-script). So the
+# hook is NOT auto-installed. Enable once per clone:  git config core.hooksPath .husky
+npx tsc --noEmit && npm run build && npm test
