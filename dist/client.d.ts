@@ -12,7 +12,15 @@ export type BillingClient = {
      * calendar month (defaults to the current month).
      */
     getUsageSummary(tenantId: string, opts?: BillingUsageSummaryOptions): Promise<BillingUsageSummary>;
-    /** Convenience helper. Fail-open: returns `true` on any non-explicit deny. */
+    /**
+     * Convenience helper — GET /api/v1/entitlements/check?app=<slug>.
+     *
+     * `feature` IS the canonical hyphenated app slug (Rello's route reads
+     * `searchParams.get("app")` and 400s when absent; after Spoke-Slug-Alignment
+     * PR 2, `TenantEntitlement.feature` stores the same canonical slug, so the
+     * one value serves both names). Fail-open: returns `true` on any
+     * non-explicit deny, and logs LOUDLY (console.error) on every failure.
+     */
     checkAccess(tenantId: string, feature: string): Promise<boolean>;
     /** POST /api/v1/billing/usage — fail-closed (throws BillingError on error). */
     reportUsage(tenantId: string, usage: UsageReport): Promise<void>;

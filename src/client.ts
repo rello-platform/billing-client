@@ -47,7 +47,15 @@ export type BillingClient = {
     tenantId: string,
     opts?: BillingUsageSummaryOptions,
   ): Promise<BillingUsageSummary>;
-  /** Convenience helper. Fail-open: returns `true` on any non-explicit deny. */
+  /**
+   * Convenience helper — GET /api/v1/entitlements/check?app=<slug>.
+   *
+   * `feature` IS the canonical hyphenated app slug (Rello's route reads
+   * `searchParams.get("app")` and 400s when absent; after Spoke-Slug-Alignment
+   * PR 2, `TenantEntitlement.feature` stores the same canonical slug, so the
+   * one value serves both names). Fail-open: returns `true` on any
+   * non-explicit deny, and logs LOUDLY (console.error) on every failure.
+   */
   checkAccess(tenantId: string, feature: string): Promise<boolean>;
 
   /** POST /api/v1/billing/usage — fail-closed (throws BillingError on error). */
@@ -320,12 +328,16 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
       const cached = cache.get<boolean>(tenantId, cacheOp);
       if (cached !== undefined) return cached;
 
+      // Rello's canonical route (src/app/api/v1/entitlements/check/route.ts)
+      // reads searchParams.get("app") and 400s when it's absent — the param
+      // MUST be `app`, not `feature` (the v0.2.0 `feature=` form made every
+      // spoke's gate 400 → fail-open → silently pass).
       const result = await executeWithRetries<{ allowed: boolean }>(
         baseUrl,
         cfg,
         {
           method: "GET",
-          path: `/entitlements/check?feature=${encodeURIComponent(feature)}`,
+          path: `/entitlements/check?app=${encodeURIComponent(feature)}`,
           tenantId,
           attempts: 3,
         },
@@ -339,6 +351,25 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
       reportError(result.error);
       logFailOpen("checkAccess", tenantId, result.error);
       const stale = cache.getStale<boolean>(tenantId, cacheOp);
+      // LOUD failure (Kelly directive 2026-06-09): the fail-open default is
+      // policy-pending, but it must never be silent. console.error fires on
+      // EVERY failed check — non-ok response and thrown/network error alike
+      // (executeWithRetries folds both into result.error).
+      console.error(
+        "[billing-client] entitlement check failed — failing OPEN",
+        {
+          app: feature,
+          tenantId,
+          status: result.error.status,
+          body: result.error.message,
+          error: result.error.code,
+          ...(result.error.requestId !== undefined
+            ? { requestId: result.error.requestId }
+            : {}),
+          fallback:
+            stale !== undefined ? `stale-cache:${stale}` : "permissive-true",
+        },
+      );
       if (stale !== undefined) return stale;
       // Permissive default — spoke app caches second-tier via local
       // BillingSubscription table per spec §Failure semantics.

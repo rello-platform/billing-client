@@ -209,9 +209,13 @@ export function createBillingClient(cfg) {
             const cached = cache.get(tenantId, cacheOp);
             if (cached !== undefined)
                 return cached;
+            // Rello's canonical route (src/app/api/v1/entitlements/check/route.ts)
+            // reads searchParams.get("app") and 400s when it's absent — the param
+            // MUST be `app`, not `feature` (the v0.2.0 `feature=` form made every
+            // spoke's gate 400 → fail-open → silently pass).
             const result = await executeWithRetries(baseUrl, cfg, {
                 method: "GET",
-                path: `/entitlements/check?feature=${encodeURIComponent(feature)}`,
+                path: `/entitlements/check?app=${encodeURIComponent(feature)}`,
                 tenantId,
                 attempts: 3,
             });
@@ -223,6 +227,21 @@ export function createBillingClient(cfg) {
             reportError(result.error);
             logFailOpen("checkAccess", tenantId, result.error);
             const stale = cache.getStale(tenantId, cacheOp);
+            // LOUD failure (Kelly directive 2026-06-09): the fail-open default is
+            // policy-pending, but it must never be silent. console.error fires on
+            // EVERY failed check — non-ok response and thrown/network error alike
+            // (executeWithRetries folds both into result.error).
+            console.error("[billing-client] entitlement check failed — failing OPEN", {
+                app: feature,
+                tenantId,
+                status: result.error.status,
+                body: result.error.message,
+                error: result.error.code,
+                ...(result.error.requestId !== undefined
+                    ? { requestId: result.error.requestId }
+                    : {}),
+                fallback: stale !== undefined ? `stale-cache:${stale}` : "permissive-true",
+            });
             if (stale !== undefined)
                 return stale;
             // Permissive default — spoke app caches second-tier via local

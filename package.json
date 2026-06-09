@@ -1,6 +1,6 @@
 {
   "name": "@rello-platform/billing-client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Rello platform billing client — typed HTTP client + webhook verifier for v1 billing API",
   "type": "module",
   "main": "./dist/index.js",

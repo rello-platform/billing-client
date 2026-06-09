@@ -153,8 +153,47 @@ describe("getStatus — fail-open reads", () => {
 });
 
 describe("checkAccess — fail-open default true", () => {
-  it("returns true on 5xx", async () => {
+  it("builds the URL with ?app= (NOT ?feature= — Rello 400s without `app`)", async () => {
+    let seenUrl = "";
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch((url) => {
+          seenUrl = url;
+          return new Response(JSON.stringify({ allowed: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      }),
+    );
+    const allowed = await client.checkAccess("t_1", "harvest-home");
+    expect(allowed).toBe(true);
+    expect(seenUrl).toBe(
+      "https://hellorello.app/api/v1/entitlements/check?app=harvest-home",
+    );
+    expect(seenUrl).not.toContain("feature=");
+  });
+
+  it("URL-encodes the app slug", async () => {
+    let seenUrl = "";
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch((url) => {
+          seenUrl = url;
+          return new Response(JSON.stringify({ allowed: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      }),
+    );
+    await client.checkAccess("t_1", "weird slug/&");
+    expect(seenUrl).toContain("?app=weird%20slug%2F%26");
+  });
+
+  it("returns true on 5xx AND logs loudly via console.error with context", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const client = createBillingClient(
       cfg({
         fetchImpl: makeFetch(() => new Response("err", { status: 503 })),
@@ -162,7 +201,69 @@ describe("checkAccess — fail-open default true", () => {
     );
     const allowed = await client.checkAccess("t_1", "homeready");
     expect(allowed).toBe(true);
+    expect(error).toHaveBeenCalledWith(
+      "[billing-client] entitlement check failed — failing OPEN",
+      expect.objectContaining({
+        app: "homeready",
+        tenantId: "t_1",
+        status: 503,
+        error: "BILLING_UPSTREAM_5XX",
+        fallback: "permissive-true",
+      }),
+    );
     warn.mockRestore();
+    error.mockRestore();
+  });
+
+  it("logs loudly via console.error on a 400 (the missing-param class)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch(() =>
+          new Response(JSON.stringify({ error: "Missing tenantId or app parameter" }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      }),
+    );
+    const allowed = await client.checkAccess("t_1", "homeready");
+    expect(allowed).toBe(true); // fail-open retained pending Kelly's policy call
+    expect(error).toHaveBeenCalledWith(
+      "[billing-client] entitlement check failed — failing OPEN",
+      expect.objectContaining({
+        app: "homeready",
+        status: 400,
+        body: expect.stringContaining("400"),
+      }),
+    );
+    warn.mockRestore();
+    error.mockRestore();
+  });
+
+  it("logs loudly via console.error on a thrown network error", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = createBillingClient(
+      cfg({
+        fetchImpl: makeFetch(() => {
+          throw new TypeError("fetch failed: ECONNREFUSED");
+        }),
+      }),
+    );
+    const allowed = await client.checkAccess("t_1", "homeready");
+    expect(allowed).toBe(true);
+    expect(error).toHaveBeenCalledWith(
+      "[billing-client] entitlement check failed — failing OPEN",
+      expect.objectContaining({
+        app: "homeready",
+        tenantId: "t_1",
+        error: "BILLING_NETWORK_ERROR",
+      }),
+    );
+    warn.mockRestore();
+    error.mockRestore();
   });
 
   it("returns server's allowed=false when API reports it", async () => {
