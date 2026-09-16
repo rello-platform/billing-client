@@ -120,7 +120,7 @@ In-memory TTL cache, 60s default, keyed by `(tenantId, operation)`. Per-process,
 
 ```bash
 npm install
-npm run build       # tsc → dist/
+npm run compile       # tsc → dist/
 npm test            # vitest
 ```
 
@@ -132,7 +132,7 @@ Publishing happens automatically on tagged push (`git tag v0.1.0 && git push --t
 
 CI (`ci.yml`) was retired 2026-05-24 (GH-Actions retirement workstream). Verification
 now runs locally via a committed husky-style `.husky/pre-push` hook — the same
-`tsc --noEmit && npm run build && npm test` the workflow ran.
+`tsc --noEmit && npm run compile && npm test` the workflow ran.
 
 The hook is **not** auto-installed (no `prepare`/`postinstall` script — this is a
 git-dep package and a lifecycle script would run in every consumer's install). Enable
