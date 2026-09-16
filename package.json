@@ -1,6 +1,6 @@
 {
   "name": "@rello-platform/billing-client",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Rello platform billing client — typed HTTP client + webhook verifier for v1 billing API",
   "type": "module",
   "main": "./dist/index.js",
@@ -22,10 +22,10 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "compile": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run compile"
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
