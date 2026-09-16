@@ -30,7 +30,7 @@ jobs:
           registry-url: https://npm.pkg.github.com
 
       - run: npm install
-      - run: npm run build
+      - run: npm run compile
       - run: npm test -- --passWithNoTests
       - run: npm publish
         env:

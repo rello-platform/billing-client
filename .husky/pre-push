@@ -10,4 +10,4 @@
 # path on Railway nixpacks (no ssh client) → platform-wide install break
 # (see feedback-rello-platform-packages-must-commit-dist-not-prepare-script). So the
 # hook is NOT auto-installed. Enable once per clone:  git config core.hooksPath .husky
-npx tsc --noEmit && npm run build && npm test
+npx tsc --noEmit && npm run compile && npm test
