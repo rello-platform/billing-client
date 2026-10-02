@@ -225,7 +225,7 @@ describe("executeWithRetries", () => {
     expect(captured?.["Content-Type"]).toBe("application/json");
   });
 
-  it("sends Idempotency-Key when provided", async () => {
+  it("sends X-Idempotency-Key (the header Rello reads) when provided", async () => {
     let captured: Record<string, string> | undefined;
     const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
       captured = init?.headers as Record<string, string>;
@@ -248,6 +248,7 @@ describe("executeWithRetries", () => {
       },
     );
 
-    expect(captured?.["Idempotency-Key"]).toBe("send_42:email_sent");
+    expect(captured?.["X-Idempotency-Key"]).toBe("send_42:email_sent");
+    expect(captured?.["Idempotency-Key"]).toBeUndefined();
   });
 });

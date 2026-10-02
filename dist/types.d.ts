@@ -7,6 +7,11 @@
  * NaN/undefined at runtime, not a compile error.
  */
 export type BillingSubscriptionStatus = "ACTIVE" | "TRIAL" | "PAST_DUE" | "CHURNED" | "SUSPENDED";
+/**
+ * The `billing.subscription_changed` WEBHOOK payload (Rello builds it in
+ * src/lib/billing/build-billing-status.ts). This is NOT what
+ * GET /api/v1/billing/status returns — that is {@link BillingStatusData}.
+ */
 export type BillingStatus = {
     tenantId: string;
     planSlug: string;
@@ -17,6 +22,76 @@ export type BillingStatus = {
     trialEndsAt: string | null;
     limits: Record<string, number>;
 };
+/**
+ * GET /api/v1/billing/status → `data`. Mirrors the object Rello builds at
+ * src/app/api/v1/billing/status/route.ts:156-169 (Rello main d9102280).
+ * Rello declares no interface for it, so the field types come from the route
+ * body and the Prisma schema. Dates arrive as ISO strings (JSON).
+ */
+export type BillingStatusData = {
+    tenant: BillingStatusTenant;
+    /** Latest Stripe subscription for the tenant's customer; null when none / Stripe off / Stripe error. */
+    subscription: BillingStatusSubscription | null;
+    /** The tenant's ACTIVE add-ons. */
+    addOns: BillingStatusAddOn[];
+    /** Current calendar-month usage per metric. */
+    usage: BillingStatusUsage[];
+    /** Plan quotas; null = no finite quota for that metric. */
+    limits: BillingQuotas;
+};
+/** Prisma `TenantStatus`. */
+export type TenantStatus = "TRIAL" | "ACTIVE" | "PAST_DUE" | "SUSPENDED" | "CHURNED" | "DELETED";
+export type BillingStatusTenant = {
+    id: string;
+    name: string;
+    status: TenantStatus;
+    /** `Tenant.plan` — a plan slug such as "growth"; null when unset. */
+    plan: string | null;
+};
+/** Stripe `Subscription.status`, passed through verbatim. */
+export type StripeSubscriptionStatus = "active" | "canceled" | "incomplete" | "incomplete_expired" | "past_due" | "paused" | "trialing" | "unpaid";
+export type BillingStatusSubscription = {
+    id: string;
+    status: StripeSubscriptionStatus;
+    planName: string | null;
+    planId: string | null;
+    /**
+     * null when Stripe omits `current_period_*` on the subscription (newer Stripe
+     * API versions moved it to the items): Rello builds `new Date(NaN)`, which
+     * JSON-serializes as null.
+     */
+    currentPeriodStart: string | null;
+    currentPeriodEnd: string | null;
+    cancelAtPeriodEnd: boolean;
+};
+export type BillingStatusAddOn = {
+    id: string;
+    name: string;
+    appSlug: string;
+    /** Prisma `SubscriptionStatus`; Rello only returns ACTIVE rows here. */
+    status: "ACTIVE" | "PAST_DUE" | "CANCELED" | "INCOMPLETE" | "TRIALING";
+    quantity: number;
+    activatedAt: string;
+};
+export type BillingStatusUsage = {
+    metric: string;
+    currentPeriodTotal: number;
+    limit: number | null;
+    percentUsed: number | null;
+};
+/** Rello's `QuotasView` (src/lib/billing/plan-limits-types.ts). */
+export type BillingQuotas = {
+    users: number | null;
+    contacts: number | null;
+    emails: number | null;
+    sms: number | null;
+    journeys: number | null;
+    aiDecisions: number | null;
+};
+/**
+ * The `billing.entitlement_changed` WEBHOOK payload. GET /api/v1/entitlements
+ * returns {@link EntitlementsCollection}, not an array of these.
+ */
 export type Entitlement = {
     feature: string;
     allowed: boolean;
@@ -31,6 +106,44 @@ export type UsageReport = {
     quantity: number;
     idempotencyKey: string;
     metadata?: Record<string, unknown>;
+};
+/** POST /api/v1/billing/usage → `data` (src/app/api/v1/billing/usage/route.ts:543-546). */
+export type UsageReportResult = {
+    recorded: true;
+    usageRecordId: string;
+    /** Present only when the emit was vendor-tagged and a CostLedger row was written. */
+    costLedgerId?: string;
+};
+/**
+ * GET /api/v1/entitlements — a FLAT body (no envelope). Mirrors Rello's
+ * `EntitlementsCollectionResponse` (src/app/api/v1/entitlements/route.ts).
+ */
+export type EntitlementsCollection = {
+    tenantId: string;
+    /** Keyed by canonical app slug. */
+    entitlements: Record<string, EntitlementsCollectionEntry>;
+};
+/** Mirrors Rello's `EntitlementsCollectionEntry`. */
+export type EntitlementsCollectionEntry = {
+    tier: string;
+    isTrialing: boolean;
+    isExpired: boolean;
+    expiresAt: string | null;
+    trialEndsAt: string | null;
+    limits: Record<string, number | null> | null;
+    currentUsage: Record<string, number> | null;
+};
+/**
+ * Options every mutating method accepts. The client sends `X-Idempotency-Key`
+ * on every mutation: generated once per logical call (a random UUID) and
+ * reused across that call's retries. Pass `idempotencyKey` to choose the key
+ * yourself — e.g. a key persisted with your own row, so a retry of the whole
+ * operation (not just one HTTP attempt) replays instead of repeating it.
+ * Rello accepts 8–128 characters after trimming; outside that the client
+ * throws before sending anything.
+ */
+export type MutationOptions = {
+    idempotencyKey?: string;
 };
 /**
  * PER-APP-BILLING-PANELS — canonical home for the GET
@@ -104,18 +217,26 @@ export type BillingUsageSummaryOptions = {
     year?: number;
     month?: number;
 };
+/**
+ * POST /api/v1/billing/checkout, plan flow. Rello reads `planId` (a Plan row
+ * id, not a slug) and an optional `billingCycle` (checkout/route.ts:147-160);
+ * the client adds the body `idempotencyKey` Rello requires.
+ */
 export type CheckoutSessionRequest = {
-    planSlug: string;
+    planId: string;
     successUrl: string;
     cancelUrl: string;
+    billingCycle?: "MONTHLY" | "ANNUAL";
 };
+/** POST /api/v1/billing/checkout → `data`. `url` is Stripe's `Session.url`, which Stripe types nullable. */
 export type CheckoutSessionResponse = {
-    url: string;
     sessionId: string;
+    url: string | null;
 };
 export type PortalSessionRequest = {
     returnUrl: string;
 };
+/** POST /api/v1/billing/portal → `data` (Rello `BillingPortalResponse`). */
 export type PortalSessionResponse = {
     url: string;
 };
@@ -123,32 +244,42 @@ export type AddOnRequest = {
     addOnId: string;
     quantity?: number;
 };
+/** POST /api/v1/billing/add-on → `data` (Rello `BillingAddOnAddResponse`). */
 export type AddOnResponse = {
     tenantAddOnId: string;
     status: string;
 };
+/** DELETE /api/v1/billing/add-on/:addOnId → `data` (Rello `BillingAddOnRemoveResponse`). */
 export type RemoveAddOnResponse = {
     ok: true;
 };
 export type SubscriptionCancelRequest = {
     atPeriodEnd: boolean;
 };
+/** POST /api/v1/billing/subscription/cancel → `data` (Rello `BillingSubscriptionCancelResponse`). */
 export type SubscriptionCancelResponse = {
     cancelsAt: string | null;
     status: string;
 };
+/** POST /api/v1/billing/subscription/resume → `data` (Rello `BillingSubscriptionResumeResponse`). */
 export type SubscriptionResumeResponse = {
     status: string;
-    periodEnd: string;
+    periodEnd: string | null;
 };
 export type SubscriptionUpdateRequest = {
     planSlug: string;
     billingCycle?: "MONTHLY" | "ANNUAL";
 };
+/** PUT /api/v1/billing/subscription → `data` (Rello `BillingSubscriptionUpdateResponse`). */
 export type SubscriptionUpdateResponse = {
     status: string;
-    periodEnd: string;
-    proration: number;
+    periodEnd: string | null;
+    proration: {
+        /** Unix seconds. */
+        prorationDate: number;
+        /** Stripe's previewed amount due; null when the preview failed. */
+        amountCents: number | null;
+    };
 };
 export type WebhookEventType = "billing.subscription_changed" | "billing.addon_changed" | "billing.invoice_paid" | "billing.invoice_failed" | "billing.trial_ending" | "billing.entitlement_changed";
 export type WebhookEvent = {
@@ -193,7 +324,9 @@ export type WebhookEvent = {
     tenantId: string;
     data: Entitlement;
 };
-export type BillingErrorCode = "BILLING_UNAUTHORIZED" | "BILLING_NOT_FOUND" | "BILLING_CONFLICT" | "BILLING_RATE_LIMITED" | "BILLING_UPSTREAM_5XX" | "BILLING_NETWORK_ERROR" | "BILLING_INVALID_REQUEST";
+export type BillingErrorCode = "BILLING_UNAUTHORIZED" | "BILLING_NOT_FOUND" | "BILLING_CONFLICT" | "BILLING_RATE_LIMITED" | "BILLING_UPSTREAM_5XX" | "BILLING_NETWORK_ERROR" | "BILLING_INVALID_REQUEST"
+/** A 2xx whose body is not Rello's contract: no envelope, success:false, or missing data. */
+ | "BILLING_INVALID_RESPONSE";
 export type FailOpenReason = "network" | "timeout" | "upstream_5xx" | "unauthorized" | "invalid_response";
 export type FailOpenEvent = {
     event: "billing_fail_open";

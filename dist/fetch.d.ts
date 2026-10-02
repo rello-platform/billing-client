@@ -9,11 +9,19 @@ import type { BillingClientConfig } from "./types.js";
  */
 export declare function normalizeApiUrl(raw: string): string;
 export declare function authToken(cfg: BillingClientConfig): string;
+/**
+ * A fresh idempotency key for one logical mutation. Rello's
+ * BillingIdempotencyKey.key is unique ACROSS tenants and a cached result is
+ * replayed to whoever presents the key, so the key must be unguessable:
+ * CSPRNG only, never Math.random.
+ */
+export declare function generateIdempotencyKey(): string;
 export type FetchOptions = {
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     path: string;
     tenantId: string;
     body?: unknown;
+    /** Sent as X-Idempotency-Key on every attempt. */
     idempotencyKey?: string;
     /** "read" gets 3 attempts; "write" gets 2. */
     attempts: 1 | 2 | 3;
@@ -25,6 +33,13 @@ export type FetchResult<T> = {
     data: T;
     requestId: string;
     status: number;
+    /**
+     * Set when Rello answered 2xx but the body was empty, unreadable, or not
+     * JSON. `data` is then undefined and must not be read. The status is still
+     * known-successful: this is a contract break, never a transport failure, so
+     * it is not retried and never becomes BILLING_NETWORK_ERROR (A-249).
+     */
+    decodeError?: string;
 };
 export type FetchFailure = {
     ok: false;
