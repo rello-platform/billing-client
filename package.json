@@ -1,6 +1,6 @@
 {
   "name": "@rello-platform/billing-client",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Rello platform billing client — typed HTTP client + webhook verifier for v1 billing API",
   "type": "module",
   "main": "./dist/index.js",
@@ -24,7 +24,7 @@
   "scripts": {
     "compile": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && tsc -p tsconfig.test.json",
     "prepublishOnly": "npm run compile",
     "hooks": "git config core.hooksPath .husky || true"
   },

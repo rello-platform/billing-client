@@ -28,8 +28,9 @@ const billing = createBillingClient({
   appSecret: process.env.RELLO_APP_SECRET,  // fallback: shared secret
 });
 
-// Reads — cached 60s, fail-open
-const status = await billing.getStatus(tenantId);
+// Reads — cached 60s, fail-open on an outage
+const status = await billing.getStatus(tenantId); // { tenant, subscription, addOns, usage, limits }
+if (status.tenant.status === "SUSPENDED") { /* ... */ }
 const allowed = await billing.checkAccess(tenantId, "homeready");
 
 // Revenue-only per-app spend summary (powers the in-app billing panel).
@@ -44,11 +45,58 @@ await billing.reportUsage(tenantId, {
   idempotencyKey: `${sendId}:email_sent`,
 });
 const session = await billing.createCheckoutSession(tenantId, {
-  planSlug: "homeready-pro",
+  planId,                      // a Rello Plan row id
   successUrl: "https://...",
   cancelUrl: "https://...",
 });
+const { url } = await billing.createPortalSession(tenantId, { returnUrl });
 ```
+
+## What every method returns
+
+Rello wraps most v1 billing responses as `{ success: true, data }`. Every
+method returns **`data`**, typed to the shape Rello's route builds (the two
+flat routes, `/entitlements` and `/entitlements/check`, return their whole
+body). A 2xx whose body is not that contract — no envelope, `success: false`,
+missing or malformed `data` — throws `BillingError` with code
+`BILLING_INVALID_RESPONSE` and a message that starts with the method name.
+An unreadable body never becomes a default.
+
+| Method | Returns |
+|---|---|
+| `getStatus` | `BillingStatusData` — `{ tenant: { id, name, status, plan }, subscription \| null, addOns, usage, limits }` |
+| `getEntitlements` | `EntitlementsCollection` — `{ tenantId, entitlements: Record<appSlug, …> }` |
+| `getUsageSummary` | `BillingUsageSummary` |
+| `checkAccess` | `boolean` (`allowed`) |
+| `reportUsage` | `UsageReportResult` — `{ recorded: true, usageRecordId, costLedgerId? }` |
+| `createCheckoutSession` | `{ sessionId, url: string \| null }` |
+| `createPortalSession` | `{ url }` |
+| `addAddOn` | `{ tenantAddOnId, status }` |
+| `removeAddOn` | `{ ok: true }` |
+| `cancelSubscription` | `{ cancelsAt, status }` |
+| `resumeSubscription` | `{ status, periodEnd: string \| null }` |
+| `updateSubscription` | `{ status, periodEnd: string \| null, proration: { prorationDate, amountCents } }` |
+
+`BillingStatus` and `Entitlement` remain exported: they are the **webhook**
+payload types (`billing.subscription_changed`, `billing.entitlement_changed`),
+not what the read methods return.
+
+## Idempotency
+
+Every mutation sends `X-Idempotency-Key` — Rello's v1 billing mutations 400
+without it. The key is generated once per logical call (a CSPRNG UUID) and
+reused across that call's retries, so a retried request replays Rello's cached
+result instead of acting twice. Pass your own as the last argument when the
+operation must stay idempotent across *your* retries too (8–128 characters;
+anything else throws before a request is sent):
+
+```ts
+await billing.addAddOn(tenantId, { addOnId }, { idempotencyKey: purchase.id });
+```
+
+`reportUsage` uses `usage.idempotencyKey` (required) as both the body key and
+the header. `createCheckoutSession` also puts the key in the body, where
+Rello's checkout route reads it.
 
 ## Webhook verification
 
@@ -86,10 +134,11 @@ If neither is provided, `createBillingClient` throws synchronously.
 
 | Operation | Failure mode |
 |-----------|-------------|
-| `getStatus` | Returns last cached value, else permissive default. Structured log emitted. |
-| `getEntitlements` | Returns last cached, else "allow all" placeholder. |
-| `getUsageSummary` | Returns last cached, else a safe-empty summary ($0, no rows/allotments, portal unavailable) — the panel always renders. Structured log emitted. |
-| `checkAccess` | Returns `true` (permissive). |
+| `getStatus` | Non-2xx or network/timeout: last cached value, else the permissive status (`tenant.plan: "fail-open-permissive"`, `ACTIVE`, no quotas). Structured log emitted. |
+| `getEntitlements` | Non-2xx or network/timeout: last cached, else `{ tenantId, entitlements: {} }`. |
+| `getUsageSummary` | Non-2xx or network/timeout: last cached, else a safe-empty summary ($0, no rows/allotments, portal unavailable) — the panel renders through an outage. Structured log emitted. |
+| `checkAccess` | Non-2xx or network/timeout: `true` (permissive), logged with `console.error`. |
+| Any read | A **2xx with an invalid body throws** (`BILLING_INVALID_RESPONSE`) — it is a contract break, not an outage. |
 | `reportUsage` | **Throws** `BillingError`. Caller is responsible for DLQ (each spoke app maintains a `UsageReportDLQ` table per spec). |
 | `createCheckoutSession`, `createPortalSession`, `addAddOn`, `removeAddOn`, `cancelSubscription`, `resumeSubscription`, `updateSubscription` | **Throw** `BillingError`. |
 
@@ -100,7 +149,7 @@ Every fail-open event emits a structured log line: `event=billing_fail_open reas
 - **Reads:** 3 attempts, 250ms / 500ms / 1s backoff. Retries on 5xx + network/timeout only.
 - **Writes:** 2 attempts. Retries on 5xx only. **Never** retries on 4xx.
 
-Every write sends an `Idempotency-Key` header when one is provided, so Rello deduplicates even on caller-side retries.
+Every write sends `X-Idempotency-Key`, the same value on each attempt (see Idempotency).
 
 ## URL normalization
 

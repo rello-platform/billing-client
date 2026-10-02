@@ -1,18 +1,25 @@
 import { TtlCache } from "./cache.js";
 import { BillingError } from "./errors.js";
-import { authToken, executeWithRetries, normalizeApiUrl } from "./fetch.js";
+import {
+  authToken,
+  executeWithRetries,
+  generateIdempotencyKey,
+  normalizeApiUrl,
+} from "./fetch.js";
+import type { FetchOptions, FetchResult } from "./fetch.js";
 import type {
   AddOnRequest,
   AddOnResponse,
   BillingClientConfig,
-  BillingStatus,
+  BillingStatusData,
   BillingUsageSummary,
   BillingUsageSummaryOptions,
   CheckoutSessionRequest,
   CheckoutSessionResponse,
-  Entitlement,
+  EntitlementsCollection,
   FailOpenEvent,
   FailOpenReason,
+  MutationOptions,
   PortalSessionRequest,
   PortalSessionResponse,
   RemoveAddOnResponse,
@@ -22,25 +29,41 @@ import type {
   SubscriptionUpdateRequest,
   SubscriptionUpdateResponse,
   UsageReport,
+  UsageReportResult,
 } from "./types.js";
 
-/** The v1 summary endpoint wraps its payload in a success envelope. */
-type BillingUsageSummaryEnvelope = {
-  success?: boolean;
-  data?: BillingUsageSummary;
-  error?: string;
-};
-
+/**
+ * Every method returns Rello's payload — the `data` of Rello's
+ * `{ success, data }` envelope, or the whole body for the two flat routes
+ * (/entitlements, /entitlements/check) — typed to the shape Rello's route
+ * actually builds. A 2xx whose body is not that contract (no envelope,
+ * `success: false`, missing or malformed `data`) throws a BillingError with
+ * code BILLING_INVALID_RESPONSE whose message starts with the method name.
+ * An unreadable body never becomes a default.
+ *
+ * Every mutation sends `X-Idempotency-Key` (see {@link MutationOptions}).
+ */
 export type BillingClient = {
-  /** GET /api/v1/billing/status — cached 60s. Fail-open. */
-  getStatus(tenantId: string): Promise<BillingStatus>;
-  /** GET /api/v1/billing/entitlements — cached 60s. Fail-open. */
-  getEntitlements(tenantId: string): Promise<Entitlement[]>;
+  /**
+   * GET /api/v1/billing/status → Rello's `data`. Cached 60s.
+   * Fail-open (unchanged from v0.3.0) on a non-2xx or a network/timeout
+   * failure: the last cached value, else a permissive status
+   * (`tenant.plan: "fail-open-permissive"`, `status: "ACTIVE"`, no quotas).
+   * A 2xx with an invalid body throws.
+   */
+  getStatus(tenantId: string): Promise<BillingStatusData>;
+  /**
+   * GET /api/v1/entitlements → `{ tenantId, entitlements }` (flat body).
+   * Cached 60s. Fail-open on a non-2xx / network failure: the last cached
+   * value, else `{ tenantId, entitlements: {} }`. A 2xx with an invalid body throws.
+   */
+  getEntitlements(tenantId: string): Promise<EntitlementsCollection>;
   /**
    * GET /api/v1/billing/usage/summary — revenue-only per-app spend summary
-   * (PER-APP-BILLING-PANELS). Cached 60s. Fail-open: returns a safe-empty
-   * summary (no rows/allotments, $0, portal unavailable) on any read miss so a
-   * billing panel never hard-errors. Optional `{ year, month }` selects a
+   * (PER-APP-BILLING-PANELS). Cached 60s. Fail-open on a non-2xx / network
+   * failure: returns a safe-empty summary (no rows/allotments, $0, portal
+   * unavailable) so a billing panel never hard-errors on Rello being down.
+   * A 2xx with an invalid body throws. Optional `{ year, month }` selects a
    * calendar month (defaults to the current month).
    */
   getUsageSummary(
@@ -48,71 +71,271 @@ export type BillingClient = {
     opts?: BillingUsageSummaryOptions,
   ): Promise<BillingUsageSummary>;
   /**
-   * Convenience helper — GET /api/v1/entitlements/check?app=<slug>.
+   * Convenience helper — GET /api/v1/entitlements/check?app=<slug> → `allowed`.
    *
    * `feature` IS the canonical hyphenated app slug (Rello's route reads
    * `searchParams.get("app")` and 400s when absent; after Spoke-Slug-Alignment
    * PR 2, `TenantEntitlement.feature` stores the same canonical slug, so the
-   * one value serves both names). Fail-open: returns `true` on any
-   * non-explicit deny, and logs LOUDLY (console.error) on every failure.
+   * one value serves both names). Fail-open: returns `true` on a non-2xx or
+   * network failure, and logs LOUDLY (console.error) on every failure. A 2xx
+   * without a boolean `allowed` throws.
    */
   checkAccess(tenantId: string, feature: string): Promise<boolean>;
 
-  /** POST /api/v1/billing/usage — fail-closed (throws BillingError on error). */
-  reportUsage(tenantId: string, usage: UsageReport): Promise<void>;
-  /** POST /api/v1/billing/checkout — fail-closed. */
+  /**
+   * POST /api/v1/billing/usage — fail-closed. `usage.idempotencyKey` is
+   * required; it goes in the body (Rello dedupes on it) and as X-Idempotency-Key.
+   */
+  reportUsage(tenantId: string, usage: UsageReport): Promise<UsageReportResult>;
+  /** POST /api/v1/billing/checkout (plan flow) — fail-closed. The key is also sent as body `idempotencyKey`, which Rello requires. */
   createCheckoutSession(
     tenantId: string,
     req: CheckoutSessionRequest,
+    opts?: MutationOptions,
   ): Promise<CheckoutSessionResponse>;
   /** POST /api/v1/billing/portal — fail-closed. */
   createPortalSession(
     tenantId: string,
     req: PortalSessionRequest,
+    opts?: MutationOptions,
   ): Promise<PortalSessionResponse>;
   /** POST /api/v1/billing/add-on — fail-closed. */
-  addAddOn(tenantId: string, req: AddOnRequest): Promise<AddOnResponse>;
+  addAddOn(
+    tenantId: string,
+    req: AddOnRequest,
+    opts?: MutationOptions,
+  ): Promise<AddOnResponse>;
   /** DELETE /api/v1/billing/add-on/:addOnId — fail-closed. */
-  removeAddOn(tenantId: string, addOnId: string): Promise<RemoveAddOnResponse>;
+  removeAddOn(
+    tenantId: string,
+    addOnId: string,
+    opts?: MutationOptions,
+  ): Promise<RemoveAddOnResponse>;
   /** POST /api/v1/billing/subscription/cancel — fail-closed. */
   cancelSubscription(
     tenantId: string,
     req: SubscriptionCancelRequest,
+    opts?: MutationOptions,
   ): Promise<SubscriptionCancelResponse>;
   /** POST /api/v1/billing/subscription/resume — fail-closed. */
-  resumeSubscription(tenantId: string): Promise<SubscriptionResumeResponse>;
+  resumeSubscription(
+    tenantId: string,
+    opts?: MutationOptions,
+  ): Promise<SubscriptionResumeResponse>;
   /** PUT /api/v1/billing/subscription — fail-closed. */
   updateSubscription(
     tenantId: string,
     req: SubscriptionUpdateRequest,
+    opts?: MutationOptions,
   ): Promise<SubscriptionUpdateResponse>;
 };
 
 const DEFAULT_CACHE_TTL_MS = 60_000;
 
-function permissiveStatus(tenantId: string): BillingStatus {
+/**
+ * The fail-open status — the v0.3.0 permissive default carried into Rello's
+ * shape: plan "fail-open-permissive" (the sentinel consumers can test for),
+ * status ACTIVE, no subscription/add-ons/usage, every quota null (= no finite
+ * quota), exactly as v0.3.0 returned `limits: {}`.
+ */
+function permissiveStatus(tenantId: string): BillingStatusData {
   return {
-    tenantId,
-    planSlug: "fail-open-permissive",
-    status: "ACTIVE",
-    monthlyPriceCents: 0,
-    currentPeriodStart: null,
-    currentPeriodEnd: null,
-    trialEndsAt: null,
-    limits: {},
+    tenant: {
+      id: tenantId,
+      name: "",
+      status: "ACTIVE",
+      plan: "fail-open-permissive",
+    },
+    subscription: null,
+    addOns: [],
+    usage: [],
+    limits: {
+      users: null,
+      contacts: null,
+      emails: null,
+      sms: null,
+      journeys: null,
+      aiDecisions: null,
+    },
   };
 }
 
-function permissiveEntitlement(feature: string): Entitlement {
-  return {
-    feature,
-    allowed: true,
-    tier: null,
-    isTrialing: false,
-    isExpired: false,
-    limits: {},
-    currentUsage: {},
-  };
+// ── Response contract ───────────────────────────────────────────────────
+
+type Guard<T> = (value: unknown) => value is T;
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+const isStringOrNull = (v: unknown): v is string | null =>
+  v === null || typeof v === "string";
+
+/*
+ * Guards check the fields that identify each payload — enough that an
+ * envelope, an error body, or another route's payload can never pass as
+ * `data`. They are not a full schema: a field Rello renames inside a valid
+ * payload is caught by the type bump in consumers, not here.
+ */
+const isStatusData: Guard<BillingStatusData> = (d): d is BillingStatusData =>
+  isRecord(d) &&
+  isRecord(d.tenant) &&
+  typeof d.tenant.id === "string" &&
+  typeof d.tenant.status === "string" &&
+  (d.subscription === null || isRecord(d.subscription)) &&
+  Array.isArray(d.addOns) &&
+  Array.isArray(d.usage) &&
+  isRecord(d.limits);
+
+const isEntitlementsCollection: Guard<EntitlementsCollection> = (
+  d,
+): d is EntitlementsCollection =>
+  isRecord(d) && typeof d.tenantId === "string" && isRecord(d.entitlements);
+
+const isUsageSummary: Guard<BillingUsageSummary> = (
+  d,
+): d is BillingUsageSummary =>
+  isRecord(d) &&
+  typeof d.appSlug === "string" &&
+  isRecord(d.period) &&
+  typeof d.totalRevenueCents === "number" &&
+  Array.isArray(d.rows) &&
+  Array.isArray(d.allotments);
+
+const isUsageReportResult: Guard<UsageReportResult> = (
+  d,
+): d is UsageReportResult =>
+  isRecord(d) && d.recorded === true && typeof d.usageRecordId === "string";
+
+const isCheckout: Guard<CheckoutSessionResponse> = (
+  d,
+): d is CheckoutSessionResponse =>
+  isRecord(d) && typeof d.sessionId === "string" && isStringOrNull(d.url);
+
+const isPortal: Guard<PortalSessionResponse> = (
+  d,
+): d is PortalSessionResponse => isRecord(d) && typeof d.url === "string";
+
+const isAddOn: Guard<AddOnResponse> = (d): d is AddOnResponse =>
+  isRecord(d) &&
+  typeof d.tenantAddOnId === "string" &&
+  typeof d.status === "string";
+
+const isRemoveAddOn: Guard<RemoveAddOnResponse> = (
+  d,
+): d is RemoveAddOnResponse => isRecord(d) && d.ok === true;
+
+const isCancel: Guard<SubscriptionCancelResponse> = (
+  d,
+): d is SubscriptionCancelResponse =>
+  isRecord(d) && typeof d.status === "string" && isStringOrNull(d.cancelsAt);
+
+const isResume: Guard<SubscriptionResumeResponse> = (
+  d,
+): d is SubscriptionResumeResponse =>
+  isRecord(d) && typeof d.status === "string" && isStringOrNull(d.periodEnd);
+
+const isUpdate: Guard<SubscriptionUpdateResponse> = (
+  d,
+): d is SubscriptionUpdateResponse =>
+  isRecord(d) &&
+  typeof d.status === "string" &&
+  isStringOrNull(d.periodEnd) &&
+  isRecord(d.proration) &&
+  typeof d.proration.prorationDate === "number";
+
+function invalidResponse(
+  operation: string,
+  opts: Pick<FetchOptions, "method" | "path">,
+  result: FetchResult<unknown>,
+  problem: string,
+): BillingError {
+  return new BillingError(
+    "BILLING_INVALID_RESPONSE",
+    result.status,
+    `${operation}: Rello returned ${result.status} for ${opts.method} ${opts.path} ${problem}`,
+    result.requestId,
+  );
+}
+
+/** Rello's `{ success: true, data }` → `data`, or throw naming the call. */
+function readEnvelope<T>(
+  operation: string,
+  opts: Pick<FetchOptions, "method" | "path">,
+  result: FetchResult<unknown>,
+  isData: Guard<T>,
+): T {
+  const body = result.data;
+  if (!isRecord(body)) {
+    throw invalidResponse(operation, opts, result, "with no JSON object body");
+  }
+  if (body.success !== true) {
+    const detail =
+      typeof body.error === "string" ? `: ${body.error.slice(0, 500)}` : "";
+    throw invalidResponse(
+      operation,
+      opts,
+      result,
+      `without success: true (success=${JSON.stringify(body.success) ?? "undefined"})${detail}`,
+    );
+  }
+  if (!isData(body.data)) {
+    throw invalidResponse(
+      operation,
+      opts,
+      result,
+      body.data === undefined || body.data === null
+        ? "with success: true but no data"
+        : "with data that is not this route's payload",
+    );
+  }
+  return body.data;
+}
+
+/** A flat (un-enveloped) Rello body → itself, or throw naming the call. */
+function readFlat<T>(
+  operation: string,
+  opts: Pick<FetchOptions, "method" | "path">,
+  result: FetchResult<unknown>,
+  isData: Guard<T>,
+): T {
+  if (!isData(result.data)) {
+    throw invalidResponse(
+      operation,
+      opts,
+      result,
+      "with a body that is not this route's payload",
+    );
+  }
+  return result.data;
+}
+
+const IDEMPOTENCY_KEY_MIN = 8;
+const IDEMPOTENCY_KEY_MAX = 128;
+
+/**
+ * One key per logical call: the caller's (trimmed, as Rello trims it) when
+ * given, else a fresh CSPRNG key. Resolved BEFORE executeWithRetries, so every
+ * retry of the call carries the same key. A caller key Rello would 400
+ * (idempotency-header.ts: 8–128 chars) throws here, before any request.
+ */
+function resolveIdempotencyKey(
+  operation: string,
+  opts: MutationOptions | undefined,
+): string {
+  if (opts?.idempotencyKey === undefined) return generateIdempotencyKey();
+  const raw: unknown = opts.idempotencyKey;
+  const key = typeof raw === "string" ? raw.trim() : "";
+  if (key.length < IDEMPOTENCY_KEY_MIN || key.length > IDEMPOTENCY_KEY_MAX) {
+    throw new BillingError(
+      "BILLING_INVALID_REQUEST",
+      400,
+      `${operation}: idempotencyKey must be 8–128 characters after trimming (Rello refuses anything else); got ${
+        typeof raw === "string" ? `${key.length} characters` : typeof raw
+      }.`,
+    );
+  }
+  return key;
 }
 
 const MONTH_LABELS = [
@@ -231,49 +454,103 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
     }
   }
 
+  /**
+   * Run one mutation: resolve its idempotency key once, send it on every
+   * attempt, throw on failure, and return Rello's `data`. `clearsCache`
+   * invalidates the read caches as soon as Rello reports a 2xx — the
+   * mutation happened even if the body then fails the contract check.
+   */
+  async function mutate<T>(
+    operation: string,
+    request: Omit<FetchOptions, "attempts" | "idempotencyKey">,
+    idempotencyKey: string,
+    isData: Guard<T>,
+    clearsCache: boolean,
+  ): Promise<T> {
+    const fetchOpts: FetchOptions = { ...request, idempotencyKey, attempts: 2 };
+    const result = await executeWithRetries<unknown>(baseUrl, cfg, fetchOpts);
+    if (!result.ok) {
+      reportError(result.error);
+      throw result.error;
+    }
+    if (clearsCache) cache.clear();
+    try {
+      return readEnvelope(operation, fetchOpts, result, isData);
+    } catch (err) {
+      reportError(err as Error);
+      throw err;
+    }
+  }
+
   return {
     async getStatus(tenantId) {
-      const cached = cache.get<BillingStatus>(tenantId, "status");
+      const cached = cache.get<BillingStatusData>(tenantId, "status");
       if (cached) return cached;
 
-      const result = await executeWithRetries<BillingStatus>(baseUrl, cfg, {
+      const fetchOpts: FetchOptions = {
         method: "GET",
         path: "/billing/status",
         tenantId,
         attempts: 3,
-      });
+      };
+      const result = await executeWithRetries<unknown>(baseUrl, cfg, fetchOpts);
       if (result.ok) {
-        cache.set(tenantId, "status", result.data);
-        return result.data;
+        let data: BillingStatusData;
+        try {
+          data = readEnvelope("getStatus", fetchOpts, result, isStatusData);
+        } catch (err) {
+          reportError(err as Error);
+          throw err;
+        }
+        cache.set(tenantId, "status", data);
+        return data;
       }
 
+      // Fail-open — unchanged from v0.3.0: any non-2xx or network/timeout
+      // failure returns the stale cached value, else the permissive status.
       reportError(result.error);
       logFailOpen("getStatus", tenantId, result.error);
-      const stale = cache.getStale<BillingStatus>(tenantId, "status");
+      const stale = cache.getStale<BillingStatusData>(tenantId, "status");
       if (stale) return stale;
       return permissiveStatus(tenantId);
     },
 
     async getEntitlements(tenantId) {
-      const cached = cache.get<Entitlement[]>(tenantId, "entitlements");
+      const cached = cache.get<EntitlementsCollection>(tenantId, "entitlements");
       if (cached) return cached;
 
-      const result = await executeWithRetries<Entitlement[]>(baseUrl, cfg, {
+      const fetchOpts: FetchOptions = {
         method: "GET",
         path: "/entitlements",
         tenantId,
         attempts: 3,
-      });
+      };
+      const result = await executeWithRetries<unknown>(baseUrl, cfg, fetchOpts);
       if (result.ok) {
-        cache.set(tenantId, "entitlements", result.data);
-        return result.data;
+        let data: EntitlementsCollection;
+        try {
+          data = readFlat(
+            "getEntitlements",
+            fetchOpts,
+            result,
+            isEntitlementsCollection,
+          );
+        } catch (err) {
+          reportError(err as Error);
+          throw err;
+        }
+        cache.set(tenantId, "entitlements", data);
+        return data;
       }
 
       reportError(result.error);
       logFailOpen("getEntitlements", tenantId, result.error);
-      const stale = cache.getStale<Entitlement[]>(tenantId, "entitlements");
+      const stale = cache.getStale<EntitlementsCollection>(
+        tenantId,
+        "entitlements",
+      );
       if (stale) return stale;
-      return [];
+      return { tenantId, entitlements: {} };
     },
 
     async getUsageSummary(tenantId, opts) {
@@ -286,34 +563,26 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
       if (opts?.year != null) query.set("year", String(opts.year));
       if (opts?.month != null) query.set("month", String(opts.month));
       const qs = query.toString();
-      const path = `/billing/usage/summary${qs ? `?${qs}` : ""}`;
+      const fetchOpts: FetchOptions = {
+        method: "GET",
+        path: `/billing/usage/summary${qs ? `?${qs}` : ""}`,
+        tenantId,
+        attempts: 3,
+      };
 
-      const result = await executeWithRetries<BillingUsageSummaryEnvelope>(
-        baseUrl,
-        cfg,
-        { method: "GET", path, tenantId, attempts: 3 },
-      );
-
+      const result = await executeWithRetries<unknown>(baseUrl, cfg, fetchOpts);
       if (result.ok) {
-        // The endpoint wraps the payload as { success, data }. A 200 with a
-        // missing/!success body is an invalid response → treat as fail-open.
-        if (result.data?.success && result.data.data) {
-          cache.set(tenantId, cacheOp, result.data.data);
-          return result.data.data;
+        // A 2xx that is not Rello's { success, data } is a contract break, not
+        // an outage: it throws rather than rendering as a $0 month.
+        let data: BillingUsageSummary;
+        try {
+          data = readEnvelope("getUsageSummary", fetchOpts, result, isUsageSummary);
+        } catch (err) {
+          reportError(err as Error);
+          throw err;
         }
-        const malformed = new BillingError(
-          "BILLING_INVALID_REQUEST",
-          result.status,
-          `Rello billing API returned ${result.status} with a missing/invalid usage summary body${
-            result.data?.error ? `: ${result.data.error}` : ""
-          }`,
-          result.requestId,
-        );
-        reportError(malformed);
-        logFailOpen("getUsageSummary", tenantId, malformed);
-        const stale = cache.getStale<BillingUsageSummary>(tenantId, cacheOp);
-        if (stale) return stale;
-        return emptyUsageSummary(cfg.appSlug, opts);
+        cache.set(tenantId, cacheOp, data);
+        return data;
       }
 
       reportError(result.error);
@@ -332,18 +601,29 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
       // reads searchParams.get("app") and 400s when it's absent — the param
       // MUST be `app`, not `feature` (the v0.2.0 `feature=` form made every
       // spoke's gate 400 → fail-open → silently pass).
-      const result = await executeWithRetries<{ allowed: boolean }>(
-        baseUrl,
-        cfg,
-        {
-          method: "GET",
-          path: `/entitlements/check?app=${encodeURIComponent(feature)}`,
-          tenantId,
-          attempts: 3,
-        },
-      );
+      const fetchOpts: FetchOptions = {
+        method: "GET",
+        path: `/entitlements/check?app=${encodeURIComponent(feature)}`,
+        tenantId,
+        attempts: 3,
+      };
+      const result = await executeWithRetries<unknown>(baseUrl, cfg, fetchOpts);
       if (result.ok) {
-        const allowed = Boolean(result.data?.allowed);
+        // The check route answers flat: { allowed, tier?, ... }. A 2xx without
+        // a boolean `allowed` is neither a grant nor a deny — it throws.
+        let allowed: boolean;
+        try {
+          allowed = readFlat(
+            "checkAccess",
+            fetchOpts,
+            result,
+            (d): d is { allowed: boolean } =>
+              isRecord(d) && typeof d.allowed === "boolean",
+          ).allowed;
+        } catch (err) {
+          reportError(err as Error);
+          throw err;
+        }
         cache.set(tenantId, cacheOp, allowed);
         return allowed;
       }
@@ -384,151 +664,108 @@ export function createBillingClient(cfg: BillingClientConfig): BillingClient {
           "reportUsage requires an idempotencyKey (Rello dedupes on this).",
         );
       }
-      const result = await executeWithRetries<{ ok: true }>(baseUrl, cfg, {
-        method: "POST",
-        path: "/billing/usage",
-        tenantId,
-        body: usage,
-        idempotencyKey: usage.idempotencyKey,
-        attempts: 2,
-      });
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
+      // Rello's usage route dedupes on the BODY idempotencyKey; the same key
+      // rides as X-Idempotency-Key like every other mutation.
+      return mutate(
+        "reportUsage",
+        { method: "POST", path: "/billing/usage", tenantId, body: usage },
+        usage.idempotencyKey,
+        isUsageReportResult,
+        false,
+      );
     },
 
-    async createCheckoutSession(tenantId, req) {
-      const result = await executeWithRetries<CheckoutSessionResponse>(
-        baseUrl,
-        cfg,
+    async createCheckoutSession(tenantId, req, opts) {
+      const key = resolveIdempotencyKey("createCheckoutSession", opts);
+      // Plan checkout reads the key from the BODY (checkout/route.ts:153-176).
+      return mutate(
+        "createCheckoutSession",
         {
           method: "POST",
           path: "/billing/checkout",
           tenantId,
-          body: req,
-          attempts: 2,
+          body: { ...req, idempotencyKey: key },
         },
+        key,
+        isCheckout,
+        false,
       );
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      return result.data;
     },
 
-    async createPortalSession(tenantId, req) {
-      const result = await executeWithRetries<PortalSessionResponse>(
-        baseUrl,
-        cfg,
-        {
-          method: "POST",
-          path: "/billing/portal",
-          tenantId,
-          body: req,
-          attempts: 2,
-        },
+    async createPortalSession(tenantId, req, opts) {
+      const key = resolveIdempotencyKey("createPortalSession", opts);
+      return mutate(
+        "createPortalSession",
+        { method: "POST", path: "/billing/portal", tenantId, body: req },
+        key,
+        isPortal,
+        false,
       );
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      return result.data;
     },
 
-    async addAddOn(tenantId, req) {
-      const result = await executeWithRetries<AddOnResponse>(baseUrl, cfg, {
-        method: "POST",
-        path: "/billing/add-on",
-        tenantId,
-        body: req,
-        attempts: 2,
-      });
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      // Invalidate read caches — entitlements likely changed.
-      cache.clear();
-      return result.data;
+    async addAddOn(tenantId, req, opts) {
+      const key = resolveIdempotencyKey("addAddOn", opts);
+      // Clears the read caches — entitlements likely changed.
+      return mutate(
+        "addAddOn",
+        { method: "POST", path: "/billing/add-on", tenantId, body: req },
+        key,
+        isAddOn,
+        true,
+      );
     },
 
-    async removeAddOn(tenantId, addOnId) {
-      const result = await executeWithRetries<RemoveAddOnResponse>(
-        baseUrl,
-        cfg,
+    async removeAddOn(tenantId, addOnId, opts) {
+      const key = resolveIdempotencyKey("removeAddOn", opts);
+      return mutate(
+        "removeAddOn",
         {
           method: "DELETE",
           path: `/billing/add-on/${encodeURIComponent(addOnId)}`,
           tenantId,
-          attempts: 2,
         },
+        key,
+        isRemoveAddOn,
+        true,
       );
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      cache.clear();
-      return result.data;
     },
 
-    async cancelSubscription(tenantId, req) {
-      const result = await executeWithRetries<SubscriptionCancelResponse>(
-        baseUrl,
-        cfg,
+    async cancelSubscription(tenantId, req, opts) {
+      const key = resolveIdempotencyKey("cancelSubscription", opts);
+      return mutate(
+        "cancelSubscription",
         {
           method: "POST",
           path: "/billing/subscription/cancel",
           tenantId,
           body: req,
-          attempts: 2,
         },
+        key,
+        isCancel,
+        true,
       );
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      cache.clear();
-      return result.data;
     },
 
-    async resumeSubscription(tenantId) {
-      const result = await executeWithRetries<SubscriptionResumeResponse>(
-        baseUrl,
-        cfg,
-        {
-          method: "POST",
-          path: "/billing/subscription/resume",
-          tenantId,
-          attempts: 2,
-        },
+    async resumeSubscription(tenantId, opts) {
+      const key = resolveIdempotencyKey("resumeSubscription", opts);
+      return mutate(
+        "resumeSubscription",
+        { method: "POST", path: "/billing/subscription/resume", tenantId },
+        key,
+        isResume,
+        true,
       );
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      cache.clear();
-      return result.data;
     },
 
-    async updateSubscription(tenantId, req) {
-      const result = await executeWithRetries<SubscriptionUpdateResponse>(
-        baseUrl,
-        cfg,
-        {
-          method: "PUT",
-          path: "/billing/subscription",
-          tenantId,
-          body: req,
-          attempts: 2,
-        },
+    async updateSubscription(tenantId, req, opts) {
+      const key = resolveIdempotencyKey("updateSubscription", opts);
+      return mutate(
+        "updateSubscription",
+        { method: "PUT", path: "/billing/subscription", tenantId, body: req },
+        key,
+        isUpdate,
+        true,
       );
-      if (!result.ok) {
-        reportError(result.error);
-        throw result.error;
-      }
-      cache.clear();
-      return result.data;
     },
   };
 }

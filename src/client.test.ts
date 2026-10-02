@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createBillingClient } from "./client.js";
 import { BillingError } from "./errors.js";
-import type { BillingClientConfig, BillingStatus } from "./types.js";
+import type { BillingClientConfig, BillingStatusData } from "./types.js";
 
 function makeFetch(
   handler: (url: string, init: RequestInit) => Response | Promise<Response>,
@@ -23,16 +23,17 @@ function cfg(over: Partial<BillingClientConfig> = {}): BillingClientConfig {
   };
 }
 
-const SAMPLE_STATUS: BillingStatus = {
-  tenantId: "t_1",
-  planSlug: "homeready-pro",
-  status: "ACTIVE",
-  monthlyPriceCents: 4900,
-  currentPeriodStart: "2026-05-01T00:00:00.000Z",
-  currentPeriodEnd: "2026-06-01T00:00:00.000Z",
-  trialEndsAt: null,
-  limits: { leads: 500 },
+// Rello's GET /api/v1/billing/status `data` (status/route.ts:156-169). Until
+// v0.4.0 this fixture was the flat webhook-shaped BillingStatus served WITHOUT
+// the envelope — a body Rello never sends, so these tests asserted the defect.
+const SAMPLE_STATUS: BillingStatusData = {
+  tenant: { id: "t_1", name: "Big Star Realty", status: "ACTIVE", plan: "homeready-pro" },
+  subscription: null,
+  addOns: [],
+  usage: [],
+  limits: { users: 5, contacts: 500, emails: null, sms: null, journeys: null, aiDecisions: null },
 };
+const SAMPLE_STATUS_BODY = JSON.stringify({ success: true, data: SAMPLE_STATUS });
 
 describe("createBillingClient — construction", () => {
   it("throws synchronously when neither apiKey nor appSecret is provided", () => {
@@ -73,7 +74,7 @@ describe("getStatus — fail-open reads", () => {
     const client = createBillingClient(
       cfg({
         fetchImpl: makeFetch(() =>
-          new Response(JSON.stringify(SAMPLE_STATUS), {
+          new Response(SAMPLE_STATUS_BODY, {
             status: 200,
             headers: { "content-type": "application/json" },
           }),
@@ -81,7 +82,7 @@ describe("getStatus — fail-open reads", () => {
       }),
     );
     const status = await client.getStatus("t_1");
-    expect(status.planSlug).toBe("homeready-pro");
+    expect(status.tenant.plan).toBe("homeready-pro");
   });
 
   it("returns cached value on subsequent call within TTL", async () => {
@@ -90,7 +91,7 @@ describe("getStatus — fail-open reads", () => {
       cfg({
         fetchImpl: makeFetch(() => {
           calls++;
-          return new Response(JSON.stringify(SAMPLE_STATUS), {
+          return new Response(SAMPLE_STATUS_BODY, {
             status: 200,
             headers: { "content-type": "application/json" },
           });
@@ -112,8 +113,8 @@ describe("getStatus — fail-open reads", () => {
       }),
     );
     const status = await client.getStatus("t_1");
-    expect(status.planSlug).toBe("fail-open-permissive");
-    expect(status.status).toBe("ACTIVE");
+    expect(status.tenant.plan).toBe("fail-open-permissive");
+    expect(status.tenant.status).toBe("ACTIVE");
     expect(onFailOpen).toHaveBeenCalledWith(
       expect.objectContaining({
         event: "billing_fail_open",
@@ -133,7 +134,7 @@ describe("getStatus — fail-open reads", () => {
         cacheTtlMs: 1,
         fetchImpl: makeFetch(() => {
           if (phase === "ok") {
-            return new Response(JSON.stringify(SAMPLE_STATUS), {
+            return new Response(SAMPLE_STATUS_BODY, {
               status: 200,
               headers: { "content-type": "application/json" },
             });
@@ -147,7 +148,7 @@ describe("getStatus — fail-open reads", () => {
     phase = "fail";
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const status = await client.getStatus("t_1");
-    expect(status.planSlug).toBe("homeready-pro");
+    expect(status.tenant.plan).toBe("homeready-pro");
     warn.mockRestore();
   });
 });
@@ -412,9 +413,12 @@ describe("getUsageSummary — revenue-only, fail-open reads", () => {
     warn.mockRestore();
   });
 
-  it("fails open when a 200 body is missing/!success (invalid_response)", async () => {
+  // v0.4.0 (D-105): a 2xx that is not Rello's envelope is a contract break,
+  // not an outage. It used to fail open to a $0 month; it now throws naming
+  // the call. 5xx / network still fail open (above).
+  it("throws naming getUsageSummary when a 200 body is !success (never a $0 default)", async () => {
     const onFailOpen = vi.fn();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const onError = vi.fn();
     const client = createBillingClient(
       cfg({
         fetchImpl: makeFetch(() =>
@@ -424,17 +428,16 @@ describe("getUsageSummary — revenue-only, fail-open reads", () => {
           }),
         ),
         onFailOpen,
+        onError,
       }),
     );
-    const summary = await client.getUsageSummary("t_1");
-    expect(summary.rows).toEqual([]);
-    expect(onFailOpen).toHaveBeenCalledWith(
-      expect.objectContaining({
-        operation: "getUsageSummary",
-        reason: "invalid_response",
-      }),
+    await expect(client.getUsageSummary("t_1")).rejects.toThrow(
+      /^getUsageSummary: .*success=false.*boom/,
     );
-    warn.mockRestore();
+    expect(onFailOpen).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "BILLING_INVALID_RESPONSE" }),
+    );
   });
 });
 
@@ -447,7 +450,7 @@ describe("writes — fail-closed", () => {
     );
     await expect(
       client.createCheckoutSession("t_1", {
-        planSlug: "homeready-pro",
+        planId: "plan_homeready_pro",
         successUrl: "https://x/s",
         cancelUrl: "https://x/c",
       }),
@@ -484,19 +487,22 @@ describe("writes — fail-closed", () => {
     ).rejects.toThrow(/idempotencyKey/);
   });
 
-  it("createCheckoutSession returns parsed response on success", async () => {
+  it("createCheckoutSession returns Rello's data on success", async () => {
     const client = createBillingClient(
       cfg({
         fetchImpl: makeFetch(() =>
           new Response(
-            JSON.stringify({ url: "https://checkout/x", sessionId: "cs_1" }),
+            JSON.stringify({
+              success: true,
+              data: { url: "https://checkout/x", sessionId: "cs_1" },
+            }),
             { status: 200, headers: { "content-type": "application/json" } },
           ),
         ),
       }),
     );
     const r = await client.createCheckoutSession("t_1", {
-      planSlug: "homeready-pro",
+      planId: "plan_homeready_pro",
       successUrl: "https://x/s",
       cancelUrl: "https://x/c",
     });
@@ -512,7 +518,7 @@ describe("URL normalization at construction time", () => {
         apiUrl: "https://hellorello.app/api",
         fetchImpl: makeFetch((url) => {
           urls.push(url);
-          return new Response(JSON.stringify(SAMPLE_STATUS), {
+          return new Response(SAMPLE_STATUS_BODY, {
             status: 200,
             headers: { "content-type": "application/json" },
           });

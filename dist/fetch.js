@@ -40,6 +40,23 @@ function genRequestId() {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 /**
+ * A fresh idempotency key for one logical mutation. Rello's
+ * BillingIdempotencyKey.key is unique ACROSS tenants and a cached result is
+ * replayed to whoever presents the key, so the key must be unguessable:
+ * CSPRNG only, never Math.random.
+ */
+export function generateIdempotencyKey() {
+    const c = globalThis.crypto;
+    if (c?.randomUUID)
+        return c.randomUUID();
+    if (c?.getRandomValues) {
+        const b = new Uint8Array(16);
+        c.getRandomValues(b);
+        return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    }
+    throw new Error("@rello-platform/billing-client: no Web Crypto in this runtime — cannot generate an idempotency key. Pass opts.idempotencyKey.");
+}
+/**
  * Sleep helper that takes a sleep impl override for tests. The default uses
  * setTimeout via promisified wrapper.
  */
@@ -61,8 +78,12 @@ async function executeOnce(baseUrl, cfg, opts, requestId) {
         "X-Request-Id": requestId,
         "Content-Type": "application/json",
     };
+    // Rello's v1 billing mutations read X-Idempotency-Key
+    // (src/lib/billing/v1/idempotency-header.ts) and 400 without it. The key is
+    // fixed by the caller of executeWithRetries, so every attempt of one logical
+    // call carries the same key.
     if (opts.idempotencyKey)
-        headers["Idempotency-Key"] = opts.idempotencyKey;
+        headers["X-Idempotency-Key"] = opts.idempotencyKey;
     const controller = new AbortController();
     const timeoutMs = cfg.timeoutMs ?? 5_000;
     const timer = setTimeout(() => controller.abort(), timeoutMs);

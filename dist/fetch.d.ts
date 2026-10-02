@@ -9,11 +9,19 @@ import type { BillingClientConfig } from "./types.js";
  */
 export declare function normalizeApiUrl(raw: string): string;
 export declare function authToken(cfg: BillingClientConfig): string;
+/**
+ * A fresh idempotency key for one logical mutation. Rello's
+ * BillingIdempotencyKey.key is unique ACROSS tenants and a cached result is
+ * replayed to whoever presents the key, so the key must be unguessable:
+ * CSPRNG only, never Math.random.
+ */
+export declare function generateIdempotencyKey(): string;
 export type FetchOptions = {
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     path: string;
     tenantId: string;
     body?: unknown;
+    /** Sent as X-Idempotency-Key on every attempt. */
     idempotencyKey?: string;
     /** "read" gets 3 attempts; "write" gets 2. */
     attempts: 1 | 2 | 3;

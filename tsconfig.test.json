@@ -1,0 +1,7 @@
+{
+  "//": "Type-checks the test files too (tsconfig.json excludes them from the build). Run by `npm test`, so a fixture transcribed from a Rello route that no longer `satisfies` the package's types fails the pre-push hook.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
