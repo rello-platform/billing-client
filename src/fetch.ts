@@ -86,6 +86,13 @@ export type FetchResult<T> = {
   data: T;
   requestId: string;
   status: number;
+  /**
+   * Set when Rello answered 2xx but the body was empty, unreadable, or not
+   * JSON. `data` is then undefined and must not be read. The status is still
+   * known-successful: this is a contract break, never a transport failure, so
+   * it is not retried and never becomes BILLING_NETWORK_ERROR (A-249).
+   */
+  decodeError?: string;
 };
 
 export type FetchFailure = {
@@ -93,6 +100,36 @@ export type FetchFailure = {
   error: BillingError;
   requestId: string;
 };
+
+async function decodeSuccessBody<T>(
+  res: Response,
+  requestId: string,
+): Promise<FetchResult<T>> {
+  const undecoded = (decodeError: string): FetchResult<T> => ({
+    ok: true,
+    data: undefined as T,
+    requestId,
+    status: res.status,
+    decodeError,
+  });
+  let text: string;
+  try {
+    text = await res.text();
+  } catch (err) {
+    return undecoded(
+      `with a body that could not be read (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (text.trim() === "") return undecoded("with an empty body");
+  try {
+    return { ok: true, data: JSON.parse(text) as T, requestId, status: res.status };
+  } catch {
+    const contentType = res.headers.get("content-type") ?? "no content-type";
+    return undecoded(
+      `with a body that is not JSON (${contentType}): ${JSON.stringify(text.slice(0, 120))}`,
+    );
+  }
+}
 
 /**
  * Single-request executor. Used for non-retried calls and for each retry attempt.
@@ -138,8 +175,12 @@ async function executeOnce<T>(
       if (res.status === 204) {
         return { ok: true, data: undefined as T, requestId, status: 204 };
       }
-      const data = (await res.json()) as T;
-      return { ok: true, data, requestId, status: res.status };
+      // Decode OUTSIDE the transport catch below: once Rello has answered 2xx,
+      // a body that is empty, unreadable or not JSON is the response's fault,
+      // not the network's. It must reach the method's contract check (which
+      // names the method) rather than be retried and reported as
+      // BILLING_NETWORK_ERROR — and a mutation must still see the 2xx.
+      return decodeSuccessBody<T>(res, requestId);
     }
 
     // Non-2xx response.

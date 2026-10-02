@@ -258,6 +258,17 @@ function invalidResponse(
   );
 }
 
+/** A 2xx whose body could not be decoded (A-249) → throw naming the call. */
+function assertDecoded(
+  operation: string,
+  opts: Pick<FetchOptions, "method" | "path">,
+  result: FetchResult<unknown>,
+): void {
+  if (result.decodeError !== undefined) {
+    throw invalidResponse(operation, opts, result, result.decodeError);
+  }
+}
+
 /** Rello's `{ success: true, data }` → `data`, or throw naming the call. */
 function readEnvelope<T>(
   operation: string,
@@ -265,6 +276,7 @@ function readEnvelope<T>(
   result: FetchResult<unknown>,
   isData: Guard<T>,
 ): T {
+  assertDecoded(operation, opts, result);
   const body = result.data;
   if (!isRecord(body)) {
     throw invalidResponse(operation, opts, result, "with no JSON object body");
@@ -292,13 +304,31 @@ function readEnvelope<T>(
   return body.data;
 }
 
-/** A flat (un-enveloped) Rello body → itself, or throw naming the call. */
+/**
+ * A flat (un-enveloped) Rello body → itself, or throw naming the call.
+ * Flat routes never send `success`, but a body that explicitly says
+ * `success: false` is a failure whatever else it carries (A-250) — it is
+ * rejected before the payload guard can accept e.g. `allowed: true` from it.
+ * A legitimate `{ allowed: false }` has no `success` key and stays valid.
+ */
 function readFlat<T>(
   operation: string,
   opts: Pick<FetchOptions, "method" | "path">,
   result: FetchResult<unknown>,
   isData: Guard<T>,
 ): T {
+  assertDecoded(operation, opts, result);
+  const body = result.data;
+  if (isRecord(body) && body.success === false) {
+    const detail =
+      typeof body.error === "string" ? `: ${body.error.slice(0, 500)}` : "";
+    throw invalidResponse(
+      operation,
+      opts,
+      result,
+      `with success: false on a flat route${detail}`,
+    );
+  }
   if (!isData(result.data)) {
     throw invalidResponse(
       operation,

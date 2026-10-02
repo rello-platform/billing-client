@@ -57,8 +57,9 @@ const { url } = await billing.createPortalSession(tenantId, { returnUrl });
 Rello wraps most v1 billing responses as `{ success: true, data }`. Every
 method returns **`data`**, typed to the shape Rello's route builds (the two
 flat routes, `/entitlements` and `/entitlements/check`, return their whole
-body). A 2xx whose body is not that contract — no envelope, `success: false`,
-missing or malformed `data` — throws `BillingError` with code
+body). A 2xx whose body is not that contract — empty or not JSON, no envelope,
+`success: false` (on a flat route too), missing or malformed `data` — throws
+`BillingError` with code
 `BILLING_INVALID_RESPONSE` and a message that starts with the method name.
 An unreadable body never becomes a default.
 
@@ -138,7 +139,7 @@ If neither is provided, `createBillingClient` throws synchronously.
 | `getEntitlements` | Non-2xx or network/timeout: last cached, else `{ tenantId, entitlements: {} }`. |
 | `getUsageSummary` | Non-2xx or network/timeout: last cached, else a safe-empty summary ($0, no rows/allotments, portal unavailable) — the panel renders through an outage. Structured log emitted. |
 | `checkAccess` | Non-2xx or network/timeout: `true` (permissive), logged with `console.error`. |
-| Any read | A **2xx with an invalid body throws** (`BILLING_INVALID_RESPONSE`) — it is a contract break, not an outage. |
+| Any read | A **2xx with an invalid body throws** (`BILLING_INVALID_RESPONSE`) — including an empty or non-JSON body. It is a contract break, not an outage: never retried, never failed open. |
 | `reportUsage` | **Throws** `BillingError`. Caller is responsible for DLQ (each spoke app maintains a `UsageReportDLQ` table per spec). |
 | `createCheckoutSession`, `createPortalSession`, `addAddOn`, `removeAddOn`, `cancelSubscription`, `resumeSubscription`, `updateSubscription` | **Throw** `BillingError`. |
 

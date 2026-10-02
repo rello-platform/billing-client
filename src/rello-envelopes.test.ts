@@ -634,3 +634,159 @@ describe("getStatus fail-open on 5xx / network: unchanged from v0.3.0", () => {
     warn.mockRestore();
   });
 });
+
+// ── Phase 50 (D-121): A-249 undecodable 2xx bodies, A-250 flat success:false ──
+
+/** A fetch that answers every request with the same raw 200 body; counts requests per path. */
+function rawFetch(body: string, contentType: string) {
+  const paths: string[] = [];
+  const fetchImpl = (async (input: string | URL | Request) => {
+    paths.push(new URL(String(input)).pathname.replace(/^\/api\/v1/, ""));
+    return new Response(body, { status: 200, headers: { "content-type": contentType } });
+  }) as unknown as typeof fetch;
+  return { fetchImpl, paths };
+}
+
+const UNDECODABLE_200: Array<{ label: string; body: string; contentType: string; says: RegExp }> = [
+  { label: "empty 200", body: "", contentType: "application/json", says: /with an empty body/ },
+  { label: "HTML 200", body: "<html>broken</html>", contentType: "text/html", says: /not JSON \(text\/html\)/ },
+];
+
+describe("A-249: a 2xx whose body is empty or not JSON is a contract error naming the method", () => {
+  for (const shape of UNDECODABLE_200) {
+    for (const call of CALLS) {
+      it(`${call.name}: ${shape.label} → BILLING_INVALID_RESPONSE naming ${call.name}, one request, no fail-open`, async () => {
+        const onError = vi.fn();
+        const onFailOpen = vi.fn();
+        const raw = rawFetch(shape.body, shape.contentType);
+        const client = createBillingClient(cfg(raw.fetchImpl, { onError, onFailOpen }));
+        const err = await call.run(client).then(
+          () => null,
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(BillingError);
+        expect((err as BillingError).code).toBe("BILLING_INVALID_RESPONSE");
+        expect((err as BillingError).status).toBe(200);
+        expect((err as BillingError).message).toMatch(new RegExp(`^${call.name}: `));
+        expect((err as BillingError).message).toMatch(shape.says); // says what was wrong with the body
+        expect(raw.paths).toHaveLength(1); // a decoded-or-not 2xx is never retried
+        expect(onFailOpen).not.toHaveBeenCalled();
+        expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: "BILLING_INVALID_RESPONSE" }));
+      });
+    }
+  }
+
+  it("cached-read control: an expired cached status does not mask an empty 200 (throws, no stale)", async () => {
+    let t = 0;
+    let n = 0;
+    const fetchImpl = (async () => {
+      n += 1;
+      return n === 1
+        ? json(200, { success: true, data: STATUS_DATA })
+        : new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = createBillingClient(cfg(fetchImpl, { cacheTtlMs: 10, now: () => t }));
+    await expect(client.getStatus("t_1")).resolves.toEqual(STATUS_DATA);
+    t = 1_000;
+    await expect(client.getStatus("t_1")).rejects.toThrow(/^getStatus: /);
+    expect(n).toBe(2);
+  });
+
+  const CACHE_CLEARING = ["addAddOn", "removeAddOn", "cancelSubscription", "resumeSubscription", "updateSubscription"];
+  for (const shape of UNDECODABLE_200) {
+    for (const name of CACHE_CLEARING) {
+      const call = CALLS.find((c) => c.name === name)!;
+      it(`${name}: a 2xx with an ${shape.label} body still invalidates the cached status`, async () => {
+        let statusReads = 0;
+        const fetchImpl = (async (input: string | URL | Request) => {
+          const path = new URL(String(input)).pathname;
+          if (path.endsWith("/billing/status")) {
+            statusReads += 1;
+            return json(200, { success: true, data: STATUS_DATA });
+          }
+          return new Response(shape.body, { status: 200, headers: { "content-type": shape.contentType } });
+        }) as unknown as typeof fetch;
+        const client = createBillingClient(cfg(fetchImpl));
+        await client.getStatus("t_1");
+        await expect(call.run(client)).rejects.toThrow(new RegExp(`^${name}: `));
+        await client.getStatus("t_1");
+        expect(statusReads).toBe(2);
+      });
+    }
+  }
+
+  it("control: HTTP 204 and JSON null stay method-named contract errors", async () => {
+    for (const res of [() => new Response(null, { status: 204 }), () => json(200, null)]) {
+      const fetchImpl = (async () => res()) as unknown as typeof fetch;
+      const client = createBillingClient(cfg(fetchImpl));
+      await expect(client.createPortalSession("t_1", { returnUrl: "https://a.example" })).rejects.toThrow(
+        /^createPortalSession: /,
+      );
+    }
+  });
+
+  it("control: a real network failure is still BILLING_NETWORK_ERROR and still fails open for reads (D-119)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let n = 0;
+    const fetchImpl = (async () => {
+      n += 1;
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+    const client = createBillingClient(cfg(fetchImpl));
+    await expect(client.getStatus("t_1")).resolves.toMatchObject({ tenant: { plan: "fail-open-permissive" } });
+    expect(n).toBe(3);
+    await expect(client.createPortalSession("t_1", { returnUrl: "https://a.example" })).rejects.toMatchObject({
+      code: "BILLING_NETWORK_ERROR",
+    });
+    warn.mockRestore();
+  });
+});
+
+describe("A-250: a flat body carrying success:false is rejected before its payload is accepted", () => {
+  it('checkAccess: {"success":false,"error":"explicit denial","allowed":true} throws naming checkAccess, not cached', async () => {
+    let n = 0;
+    const fetchImpl = (async () => {
+      n += 1;
+      return json(200, { success: false, error: "explicit denial", allowed: true });
+    }) as unknown as typeof fetch;
+    const onError = vi.fn();
+    const client = createBillingClient(cfg(fetchImpl, { onError }));
+    await expect(client.checkAccess("t_1", "homeready")).rejects.toThrow(/^checkAccess: .*explicit denial/);
+    await expect(client.checkAccess("t_1", "homeready")).rejects.toThrow(/^checkAccess: /);
+    expect(n).toBe(2);
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: "BILLING_INVALID_RESPONSE" }));
+  });
+
+  it('getEntitlements: {"success":false,…,"tenantId":"t1","entitlements":{}} throws naming getEntitlements, not cached', async () => {
+    let n = 0;
+    const fetchImpl = (async () => {
+      n += 1;
+      return json(200, { success: false, error: "explicit denial", tenantId: "t1", entitlements: {} });
+    }) as unknown as typeof fetch;
+    const client = createBillingClient(cfg(fetchImpl));
+    await expect(client.getEntitlements("t_1")).rejects.toThrow(/^getEntitlements: .*explicit denial/);
+    await expect(client.getEntitlements("t_1")).rejects.toThrow(/^getEntitlements: /);
+    expect(n).toBe(2);
+  });
+
+  it("control: a legitimate {allowed:false} is still a deny, cached", async () => {
+    let n = 0;
+    const fetchImpl = (async () => {
+      n += 1;
+      return json(200, { allowed: false });
+    }) as unknown as typeof fetch;
+    const client = createBillingClient(cfg(fetchImpl));
+    await expect(client.checkAccess("t_1", "homeready")).resolves.toBe(false);
+    await expect(client.checkAccess("t_1", "homeready")).resolves.toBe(false);
+    expect(n).toBe(1);
+  });
+
+  it("control: Rello's catch-path {allowed:false} and a flat collection without `success` stay valid", async () => {
+    const rello = fakeRello({
+      bodies: { "GET /entitlements/check": { allowed: false } },
+    });
+    const client = createBillingClient(cfg(rello.fetchImpl));
+    await expect(client.checkAccess("t_1", "homeready")).resolves.toBe(false);
+    await expect(client.getEntitlements("t_1")).resolves.toEqual(ENTITLEMENTS_BODY);
+  });
+});

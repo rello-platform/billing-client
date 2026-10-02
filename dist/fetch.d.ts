@@ -33,6 +33,13 @@ export type FetchResult<T> = {
     data: T;
     requestId: string;
     status: number;
+    /**
+     * Set when Rello answered 2xx but the body was empty, unreadable, or not
+     * JSON. `data` is then undefined and must not be read. The status is still
+     * known-successful: this is a contract break, never a transport failure, so
+     * it is not retried and never becomes BILLING_NETWORK_ERROR (A-249).
+     */
+    decodeError?: string;
 };
 export type FetchFailure = {
     ok: false;

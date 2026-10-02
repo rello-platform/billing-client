@@ -64,6 +64,31 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 const BACKOFF_MS = [250, 500, 1000];
+async function decodeSuccessBody(res, requestId) {
+    const undecoded = (decodeError) => ({
+        ok: true,
+        data: undefined,
+        requestId,
+        status: res.status,
+        decodeError,
+    });
+    let text;
+    try {
+        text = await res.text();
+    }
+    catch (err) {
+        return undecoded(`with a body that could not be read (${err instanceof Error ? err.message : String(err)})`);
+    }
+    if (text.trim() === "")
+        return undecoded("with an empty body");
+    try {
+        return { ok: true, data: JSON.parse(text), requestId, status: res.status };
+    }
+    catch {
+        const contentType = res.headers.get("content-type") ?? "no content-type";
+        return undecoded(`with a body that is not JSON (${contentType}): ${JSON.stringify(text.slice(0, 120))}`);
+    }
+}
 /**
  * Single-request executor. Used for non-retried calls and for each retry attempt.
  * Throws on network/timeout/5xx; returns BillingError for 4xx (so the retry loop
@@ -101,8 +126,12 @@ async function executeOnce(baseUrl, cfg, opts, requestId) {
             if (res.status === 204) {
                 return { ok: true, data: undefined, requestId, status: 204 };
             }
-            const data = (await res.json());
-            return { ok: true, data, requestId, status: res.status };
+            // Decode OUTSIDE the transport catch below: once Rello has answered 2xx,
+            // a body that is empty, unreadable or not JSON is the response's fault,
+            // not the network's. It must reach the method's contract check (which
+            // names the method) rather than be retried and reported as
+            // BILLING_NETWORK_ERROR — and a mutation must still see the 2xx.
+            return decodeSuccessBody(res, requestId);
         }
         // Non-2xx response.
         let detail = "";
